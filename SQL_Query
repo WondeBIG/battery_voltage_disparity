@@ -1,0 +1,120 @@
+WITH logs_match AS (
+    -- Match charger logs to battery data based on log IDs and MAC addresses
+    SELECT
+        hub_id,
+        logs_id,
+        TRIM(REPLACE(metadata['widget']['mac_address'], '"', ' ')) AS mac_address,
+        metadata['battery_health']['cell_balance']['lowest_voltage_gradient_mv']::FLOAT AS lowest_voltage_gradient
+    FROM 
+        analytics.charger_logs
+),
+flattened_logs AS (
+    -- Flatten arrays of flight and log IDs for battery tracking
+    SELECT 
+        pc.*,
+        c.value AS flight_id,
+        f.value AS log_id
+    FROM 
+        analytics.charging_sessions pc,
+        LATERAL FLATTEN(input => pc.logs_ids) f,
+        LATERAL FLATTEN(input => pc.all_flight_ids) c
+),
+joined AS (
+    -- Aggregate battery charging logs with flight and hub information
+    SELECT DISTINCT 
+        ARRAY_TO_STRING(fl.all_flight_ids, ', ') AS flight_ids,
+        parent_serial AS battery,
+        fl.battery_a_cpu,
+        fl.pdb_mac_address::VARCHAR AS pdb_mac_address,
+        fl.hub_id,
+        h.hub_name,
+        (fl.start_unix / 1000)::TIMESTAMP AS start_time,
+        (fl.charging_ended_timestamp / 1000)::TIMESTAMP AS charge_completed,
+        charging_duration_s / 60 AS charge_duration_m,
+        ARRAY_TO_STRING(fl.logs_ids, ', ') AS logs_id,
+        fl.mac_address,
+        lowest_voltage_gradient,
+        IFF(lowest_voltage_gradient >= 40, 1, 0) AS BVG -- Binary Voltage Gradient Indicator
+    FROM 
+        flattened_logs fl
+    LEFT JOIN logs_match lm ON lm.logs_id = fl.log_id AND fl.mac_address = lm.mac_address
+    LEFT JOIN analytics.hubs h ON h.hub_id = fl.hub_id
+    LEFT JOIN analytics.cpu_registry csp ON fl.battery_a_cpu = csp.cpu_id 
+        AND date_added <= start_time 
+        AND (date_removed IS NULL OR date_removed >= start_time) 
+    WHERE 
+        is_production_hub
+    ORDER BY 
+        start_time DESC NULLS LAST,
+        lowest_voltage_gradient DESC
+),
+battery_inservice AS (
+    -- Determine the time a battery has been in service using first flight records and service logs
+    SELECT 
+        b.battery_serial,
+        -- Determine the earliest known service date using ODOO data or first recorded flight
+        CASE 
+            WHEN fv.service_date IS NULL OR first_flight_day IS NULL 
+            THEN COALESCE(fv.service_date, first_flight_day)
+            ELSE LEAST(fv.service_date, first_flight_day)
+        END AS in_service_day,
+        b.stock_location,
+        b.model,
+        b.total_flights,
+        b.total_flight_duration_s / 60 AS total_flight_duration_m,
+        b.status
+    FROM 
+        analytics.battery_inventory b
+    LEFT JOIN analytics.vehicle_registry fv ON fv.lot_id = b.lot_id
+    LEFT JOIN (
+        -- Subquery to determine first flight date for batteries
+        SELECT DISTINCT 
+            DATE_TRUNC('day', launch_timestamp) AS first_flight_day,
+            top_parent_lot_id AS lot_id,
+            top_parent_serial_number AS serial_number
+        FROM 
+            analytics.flight_part_history
+        QUALIFY RANK() OVER (
+            PARTITION BY top_parent_serial_number
+            ORDER BY first_flight_day ASC
+        ) = 1
+    ) ffd ON ffd.serial_number = b.battery_serial
+    WHERE 
+        b.model = 'Battery'
+        AND in_service_day IS NOT NULL
+    ORDER BY 
+        in_service_day DESC
+)
+SELECT 
+    j.*,
+    DATEDIFF('months', in_service_day, start_time) AS months_in_service,
+    status,
+    battery_soh,
+    capacity_estimate,
+    last_estimate_date,
+    total_flights,
+    total_flight_duration_m,
+    DATE_TRUNC('day', start_time) = DATE_TRUNC('day', CURRENT_DATE()) AS today,
+    DATE_TRUNC('week', start_time) = DATE_TRUNC('week', CURRENT_DATE()) AS this_week,
+    DATE_TRUNC('month', start_time) = DATE_TRUNC('month', CURRENT_DATE()) AS this_month
+FROM 
+    joined j
+LEFT JOIN battery_inservice bis ON bis.battery_serial = j.battery
+LEFT JOIN analytics.daily_battery_health dbh ON dbh.battery = j.battery 
+    AND dbh.date_day = DATE_TRUNC('day', start_time)
+WHERE 
+    j.battery IS NOT NULL 
+    AND BVG = 1
+QUALIFY RANK() OVER (
+    PARTITION BY 
+        flight_ids, 
+        j.battery,
+        battery_a_cpu, 
+        pdb_mac_address, 
+        hub_id, 
+        logs_id, 
+        mac_address,
+        start_time
+    ORDER BY 
+        lowest_voltage_gradient DESC NULLS LAST
+) = 1;
